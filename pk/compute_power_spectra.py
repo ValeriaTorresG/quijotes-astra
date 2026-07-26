@@ -7,7 +7,7 @@ The numerical recipe follows ``power_spec.ipynb``:
 * convert the mesh to the density contrast;
 * evaluate P0, P2, and P4 with ``Pk_library.Pk``;
 * subtract the Poisson shot noise, V/N, from the monopole only;
-* retain the native Pylians shells in the requested k interval.
+* retain the native Pylians shells or aggregate them into fixed k bins.
 
 Positions are read directly from the Quijote FoF catalogue.  This is equivalent
 to selecting ``RANDITER == -1`` from ASTRA's raw FITS product, but avoids
@@ -55,6 +55,7 @@ DEFAULT_AXIS = 0
 DEFAULT_THREADS = 1
 DEFAULT_KMIN = 0.008
 DEFAULT_KMAX = 0.5
+DEFAULT_K_BIN_WIDTH_FACTOR = 2.0
 
 SNAPSHOT_REDSHIFTS = {0: 3.0, 1: 2.0, 2: 1.0, 3: 0.5, 4: 0.0}
 ENVIRONMENT_COLUMNS = (
@@ -107,6 +108,10 @@ PLOT_METADATA_COLUMNS = (
     + PLOT_ENVIRONMENT_METADATA_COLUMNS
     + ("astra_probability_sha256",)
 )
+PLOT_OPTIONAL_BINNING_METADATA_COLUMNS = (
+    "binning_mode",
+    "k_bin_width_h_Mpc",
+)
 
 LEGACY_CSV_COLUMNS = (
     "dataset",
@@ -146,12 +151,21 @@ LEGACY_CSV_COLUMNS = (
     "sigma_Pk0_notebook_Mpc3_h3",
     "Nmodes",
 )
-CSV_COLUMNS = LEGACY_CSV_COLUMNS + (
+PRE_BINNING_CSV_COLUMNS = LEGACY_CSV_COLUMNS + (
     "astra_classification_sha256",
     "astra_classification_files",
     "astra_raw_sha256",
     "selection_rule",
 )
+BINNING_CSV_COLUMNS = (
+    "binning_mode",
+    "k_fundamental_h_Mpc",
+    "k_bin_width_h_Mpc",
+    "k_bin_index",
+    "k_bin_min_h_Mpc",
+    "k_bin_max_h_Mpc",
+)
+CSV_COLUMNS = PRE_BINNING_CSV_COLUMNS + BINNING_CSV_COLUMNS
 
 
 class PowerSpectrumError(RuntimeError):
@@ -176,6 +190,11 @@ class Spectrum:
     n_objects: int
     number_density: float
     shot_noise: float
+    binning_mode: str = "native_pylians"
+    k_bin_width: float | None = None
+    k_bin_index: np.ndarray | None = None
+    k_bin_min: np.ndarray | None = None
+    k_bin_max: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -402,6 +421,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_KMAX,
         help="maximum retained k in h/Mpc",
     )
+    parser.add_argument(
+        "--k-bin-width",
+        type=float,
+        nargs="?",
+        const=0.0,
+        default=None,
+        metavar="DK",
+        help=(
+            "post-bin the native Pylians shells with fixed width DK in h/Mpc; "
+            "omit for native shells; pass the flag alone or 0 for "
+            "Delta k=2*k_fundamental; custom DK must be an integer multiple "
+            "of k_fundamental"
+        ),
+    )
     sample_group = parser.add_mutually_exclusive_group()
     sample_group.add_argument(
         "--matter-only",
@@ -476,6 +509,14 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         parser.error("--kmin and --kmax must be finite")
     if args.kmin < 0.0 or args.kmax <= args.kmin:
         parser.error("--kmin must be non-negative and smaller than --kmax")
+    if args.k_bin_width is not None and (
+        not math.isfinite(args.k_bin_width) or args.k_bin_width < 0.0
+    ):
+        parser.error("--k-bin-width must be finite and non-negative")
+    try:
+        resolve_k_bin_width(args.box_size, args.k_bin_width)
+    except PowerSpectrumError as exc:
+        parser.error(str(exc))
     if args.grid < 2:
         parser.error("--grid must be at least 2")
     if args.random_void_only and args.skip_random_void:
@@ -1613,6 +1654,183 @@ def read_random_void_positions_from_raw(
     return np.ascontiguousarray(positions), provenance
 
 
+def resolve_k_bin_width(
+    box_size: float,
+    requested_width: float | None,
+) -> float | None:
+    """Resolve the optional fixed bin width without changing native defaults."""
+
+    if requested_width is None:
+        return None
+    k_fundamental = 2.0 * math.pi / float(box_size)
+    width = (
+        DEFAULT_K_BIN_WIDTH_FACTOR * k_fundamental
+        if requested_width == 0.0
+        else float(requested_width)
+    )
+    if not math.isfinite(width) or width <= 0.0:
+        raise PowerSpectrumError(
+            f"resolved k-bin width must be finite and positive, got {width}"
+        )
+    if width < k_fundamental * (1.0 - 1.0e-10):
+        raise PowerSpectrumError(
+            f"k-bin width {width:.12g} h/Mpc is smaller than the native "
+            f"Pylians resolution k_fundamental={k_fundamental:.12g} h/Mpc"
+        )
+    shells_per_bin = int(round(width / k_fundamental))
+    aligned_width = shells_per_bin * k_fundamental
+    if shells_per_bin < 1 or not math.isclose(
+        width,
+        aligned_width,
+        rel_tol=1.0e-7,
+        abs_tol=k_fundamental * 1.0e-10,
+    ):
+        raise PowerSpectrumError(
+            f"k-bin width {width:.12g} h/Mpc must be an integer multiple of "
+            f"the native Pylians resolution "
+            f"k_fundamental={k_fundamental:.12g} h/Mpc; pass "
+            "--k-bin-width without a value for the recommended 2*k_fundamental"
+        )
+    return aligned_width
+
+
+def make_k_bin_edges(
+    box_size: float,
+    grid: int,
+    kmax: float,
+    requested_width: float,
+) -> tuple[np.ndarray, float]:
+    """Return the fixed edges used to post-bin native Pylians shells."""
+
+    width = resolve_k_bin_width(box_size, requested_width)
+    if width is None:
+        raise PowerSpectrumError("a k-bin width is required to construct edges")
+    k_nyquist = math.pi * float(grid) / float(box_size)
+    k_stop = min(float(kmax), k_nyquist)
+    if not math.isfinite(k_stop) or k_stop <= 0.0:
+        raise PowerSpectrumError(
+            f"kmax must define a positive binning interval, got {kmax}"
+        )
+    n_bins = max(1, int(math.ceil(k_stop / width - 1.0e-12)))
+    edges = width * np.arange(n_bins + 1, dtype=np.float64)
+    return edges, width
+
+
+def rebin_spectrum(
+    spectrum: Spectrum,
+    edges: np.ndarray,
+    bin_width: float,
+) -> Spectrum:
+    """Aggregate Pylians shells into fixed bins using ``Nmodes`` weights."""
+
+    edges = np.asarray(edges, dtype=np.float64)
+    if (
+        edges.ndim != 1
+        or len(edges) < 2
+        or not np.all(np.isfinite(edges))
+        or np.any(np.diff(edges) <= 0.0)
+    ):
+        raise PowerSpectrumError("k-bin edges must be finite and increasing")
+    widths = np.diff(edges)
+    if not np.allclose(
+        widths,
+        float(bin_width),
+        rtol=1.0e-10,
+        atol=max(1.0e-14, abs(float(bin_width)) * 1.0e-12),
+    ):
+        raise PowerSpectrumError("k-bin edges do not have the requested width")
+
+    arrays = (
+        spectrum.k,
+        spectrum.pk0_raw,
+        spectrum.pk2,
+        spectrum.pk4,
+        spectrum.nmodes,
+    )
+    if any(np.asarray(values).shape != spectrum.k.shape for values in arrays):
+        raise PowerSpectrumError("native Pylians spectrum arrays have unequal shapes")
+    k = np.asarray(spectrum.k, dtype=np.float64)
+    nmodes = np.asarray(spectrum.nmodes, dtype=np.int64)
+    if (
+        k.ndim != 1
+        or len(k) == 0
+        or np.any(nmodes <= 0)
+        or np.any(np.diff(k) <= 0.0)
+    ):
+        raise PowerSpectrumError(
+            "native Pylians shells must have increasing k and positive Nmodes"
+        )
+
+    n_bins = len(edges) - 1
+    bin_index = np.searchsorted(edges, k, side="right") - 1
+    at_last_edge = np.isclose(
+        k,
+        edges[-1],
+        rtol=0.0,
+        atol=max(1.0e-14, abs(edges[-1]) * 1.0e-12),
+    )
+    bin_index[at_last_edge] = n_bins - 1
+    if np.any(bin_index < 0) or np.any(bin_index >= n_bins):
+        raise PowerSpectrumError(
+            "one or more retained Pylians shells lie outside the k-bin edges"
+        )
+
+    mode_weights = nmodes.astype(np.float64)
+    mode_sums = np.bincount(
+        bin_index,
+        weights=mode_weights,
+        minlength=n_bins,
+    )
+    nonempty = np.flatnonzero(mode_sums > 0.0)
+    if len(nonempty) == 0:
+        raise PowerSpectrumError("fixed k bins contain no Pylians shells")
+
+    def weighted(values: np.ndarray) -> np.ndarray:
+        sums = np.bincount(
+            bin_index,
+            weights=np.asarray(values, dtype=np.float64) * mode_weights,
+            minlength=n_bins,
+        )
+        return sums[nonempty] / mode_sums[nonempty]
+
+    binned_modes_float = mode_sums[nonempty]
+    binned_modes = np.rint(binned_modes_float).astype(np.int64)
+    if not np.allclose(
+        binned_modes_float,
+        binned_modes,
+        rtol=0.0,
+        atol=1.0e-6,
+    ):
+        raise PowerSpectrumError("binned Nmodes values are not integral")
+    if int(np.sum(binned_modes)) != int(np.sum(nmodes)):
+        raise PowerSpectrumError("k binning did not conserve the total Nmodes")
+
+    binned_k = weighted(k)
+    binned_pk0 = weighted(spectrum.pk0_raw)
+    binned_pk2 = weighted(spectrum.pk2)
+    binned_pk4 = weighted(spectrum.pk4)
+    binned_sigma = binned_pk0 * np.sqrt(2.0 / binned_modes)
+    return Spectrum(
+        k=np.ascontiguousarray(binned_k),
+        pk0_raw=np.ascontiguousarray(binned_pk0),
+        pk0_shot_subtracted=np.ascontiguousarray(
+            binned_pk0 - spectrum.shot_noise
+        ),
+        pk2=np.ascontiguousarray(binned_pk2),
+        pk4=np.ascontiguousarray(binned_pk4),
+        sigma_pk0=np.ascontiguousarray(binned_sigma),
+        nmodes=np.ascontiguousarray(binned_modes),
+        n_objects=spectrum.n_objects,
+        number_density=spectrum.number_density,
+        shot_noise=spectrum.shot_noise,
+        binning_mode="fixed_nmodes_weighted",
+        k_bin_width=float(bin_width),
+        k_bin_index=np.ascontiguousarray(nonempty, dtype=np.int64),
+        k_bin_min=np.ascontiguousarray(edges[nonempty]),
+        k_bin_max=np.ascontiguousarray(edges[nonempty + 1]),
+    )
+
+
 def compute_spectrum(
     positions: np.ndarray,
     mas_library: Any,
@@ -1626,6 +1844,7 @@ def compute_spectrum(
     kmin: float,
     kmax: float,
     verbose: bool,
+    k_bin_width: float | None = None,
 ) -> Spectrum:
     """Run one sequential Pylians mesh and FFT calculation."""
 
@@ -1706,7 +1925,7 @@ def compute_spectrum(
     if not np.allclose(nmodes[mask], rounded_modes, rtol=0.0, atol=1.0e-6):
         raise PowerSpectrumError("Pk_library returned non-integer Nmodes values")
 
-    return Spectrum(
+    spectrum = Spectrum(
         k=k[mask],
         pk0_raw=pk0[mask],
         pk0_shot_subtracted=pk0_shot_subtracted[mask],
@@ -1718,6 +1937,15 @@ def compute_spectrum(
         number_density=number_density,
         shot_noise=shot_noise,
     )
+    if k_bin_width is None:
+        return spectrum
+    edges, resolved_width = make_k_bin_edges(
+        box_size,
+        grid,
+        kmax,
+        k_bin_width,
+    )
+    return rebin_spectrum(spectrum, edges, resolved_width)
 
 
 def write_spectrum_csv(
@@ -1745,6 +1973,33 @@ def write_spectrum_csv(
     if path.exists() and not overwrite:
         raise FileExistsError(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    is_binned = spectrum.binning_mode == "fixed_nmodes_weighted"
+    if is_binned:
+        bin_arrays = (
+            spectrum.k_bin_index,
+            spectrum.k_bin_min,
+            spectrum.k_bin_max,
+        )
+        if (
+            spectrum.k_bin_width is None
+            or any(values is None for values in bin_arrays)
+            or any(
+                np.asarray(values).shape != spectrum.k.shape
+                for values in bin_arrays
+                if values is not None
+            )
+        ):
+            raise PowerSpectrumError(
+                "binned spectrum is missing width, indices, or bin edges"
+            )
+    elif (
+        spectrum.binning_mode != "native_pylians"
+        or spectrum.k_bin_width is not None
+        or spectrum.k_bin_index is not None
+        or spectrum.k_bin_min is not None
+        or spectrum.k_bin_max is not None
+    ):
+        raise PowerSpectrumError("native spectrum contains inconsistent bin metadata")
     redshift = (
         astra_provenance.redshift
         if astra_provenance is not None
@@ -1817,6 +2072,13 @@ def write_spectrum_csv(
         "k_max_h_Mpc": _format_float(kmax),
         "k_nyquist_h_Mpc": _format_float(k_nyquist),
         "shot_noise_Mpc3_h3": _format_float(spectrum.shot_noise),
+        "binning_mode": spectrum.binning_mode,
+        "k_fundamental_h_Mpc": _format_float(2.0 * math.pi / box_size),
+        "k_bin_width_h_Mpc": (
+            ""
+            if spectrum.k_bin_width is None
+            else _format_float(spectrum.k_bin_width)
+        ),
         "astra_classification_sha256": (
             ""
             if astra_provenance is None
@@ -1869,6 +2131,21 @@ def write_spectrum_csv(
                             spectrum.sigma_pk0[row_index]
                         ),
                         "Nmodes": int(spectrum.nmodes[row_index]),
+                        "k_bin_index": (
+                            ""
+                            if spectrum.k_bin_index is None
+                            else int(spectrum.k_bin_index[row_index])
+                        ),
+                        "k_bin_min_h_Mpc": (
+                            ""
+                            if spectrum.k_bin_min is None
+                            else _format_float(spectrum.k_bin_min[row_index])
+                        ),
+                        "k_bin_max_h_Mpc": (
+                            ""
+                            if spectrum.k_bin_max is None
+                            else _format_float(spectrum.k_bin_max[row_index])
+                        ),
                     }
                 )
                 writer.writerow(row)
@@ -1958,7 +2235,16 @@ def read_power_spectrum_curve(
             f"{path}: n_k_shells={n_shells}, but CSV contains {len(rows)} rows"
         )
 
-    stable_columns = PLOT_METADATA_COLUMNS + ("sample", "n_k_shells")
+    optional_binning_columns = tuple(
+        column
+        for column in PLOT_OPTIONAL_BINNING_METADATA_COLUMNS
+        if column in fieldnames
+    )
+    stable_columns = (
+        PLOT_METADATA_COLUMNS
+        + optional_binning_columns
+        + ("sample", "n_k_shells")
+    )
     stable = {column: first[column] for column in stable_columns}
     k_values = np.empty(len(rows), dtype=np.float64)
     pk0_values = np.empty(len(rows), dtype=np.float64)
@@ -1977,6 +2263,12 @@ def read_power_spectrum_curve(
             f"{path}: k_h_Mpc must be positive and strictly increasing"
         )
     metadata = {column: first[column] for column in PLOT_METADATA_COLUMNS}
+    metadata.update(
+        {
+            "binning_mode": first.get("binning_mode", "native_pylians"),
+            "k_bin_width_h_Mpc": first.get("k_bin_width_h_Mpc", ""),
+        }
+    )
     return PowerSpectrumCurve(
         k=k_values,
         pk0_raw=pk0_values,
@@ -2022,6 +2314,12 @@ def build_normalized_power_spectra(
             sample=name,
         )
         for column in PLOT_SHARED_METADATA_COLUMNS:
+            if curve.metadata[column] != matter.metadata[column]:
+                raise PowerSpectrumError(
+                    f"{path}: {column}={curve.metadata[column]!r} differs "
+                    f"from all-halo CSV value {matter.metadata[column]!r}"
+                )
+        for column in PLOT_OPTIONAL_BINNING_METADATA_COLUMNS:
             if curve.metadata[column] != matter.metadata[column]:
                 raise PowerSpectrumError(
                     f"{path}: {column}={curve.metadata[column]!r} differs "
@@ -2253,17 +2551,28 @@ def validate_existing_spectrum_csv(
 ) -> None:
     """Require an existing CSV to be complete and reproducibly compatible."""
 
-    has_extended_columns = False
+    has_provenance_columns = False
+    has_binning_columns = False
     try:
         with path.open("r", encoding="utf-8", newline="") as handle:
             reader = csv.DictReader(handle)
-            has_extended_columns = reader.fieldnames == list(CSV_COLUMNS)
+            has_binning_columns = reader.fieldnames == list(CSV_COLUMNS)
+            is_pre_binning = reader.fieldnames == list(
+                PRE_BINNING_CSV_COLUMNS
+            )
             is_legacy = reader.fieldnames == list(LEGACY_CSV_COLUMNS)
-            if not has_extended_columns and not is_legacy:
+            has_provenance_columns = has_binning_columns or is_pre_binning
+            if not has_provenance_columns and not is_legacy:
                 raise PowerSpectrumError(
                     f"{path}: columns do not match the current output schema"
                 )
-            if sample == RANDOM_VOID_SAMPLE and not has_extended_columns:
+            requested_bin_width = getattr(args, "k_bin_width", None)
+            if requested_bin_width is not None and not has_binning_columns:
+                raise PowerSpectrumError(
+                    f"{path}: an existing pre-binning CSV cannot satisfy "
+                    "--k-bin-width"
+                )
+            if sample == RANDOM_VOID_SAMPLE and not has_provenance_columns:
                 raise PowerSpectrumError(
                     f"{path}: random-void products require classification/raw "
                     "provenance columns"
@@ -2297,7 +2606,19 @@ def validate_existing_spectrum_csv(
             "" if astra_provenance is None else str(astra_provenance.periodic)
         ),
     }
-    if has_extended_columns:
+    expected_bin_width = resolve_k_bin_width(
+        args.box_size,
+        getattr(args, "k_bin_width", None),
+    )
+    expected_edges = None
+    if expected_bin_width is not None:
+        expected_edges, _ = make_k_bin_edges(
+            args.box_size,
+            args.grid,
+            args.kmax,
+            expected_bin_width,
+        )
+    if has_provenance_columns:
         expected_strings.update(
             {
                 "astra_classification_sha256": (
@@ -2314,6 +2635,16 @@ def validate_existing_spectrum_csv(
                     RANDOM_VOID_SELECTION_RULE
                     if sample == RANDOM_VOID_SAMPLE
                     else ""
+                ),
+            }
+        )
+    if has_binning_columns:
+        expected_strings.update(
+            {
+                "binning_mode": (
+                    "native_pylians"
+                    if expected_bin_width is None
+                    else "fixed_nmodes_weighted"
                 ),
             }
         )
@@ -2338,7 +2669,7 @@ def validate_existing_spectrum_csv(
             else astra_provenance.random_seed
         ),
     }
-    if has_extended_columns:
+    if has_provenance_columns:
         expected_optional_integers["astra_classification_files"] = (
             None
             if astra_provenance is None
@@ -2352,6 +2683,10 @@ def validate_existing_spectrum_csv(
         "k_max_h_Mpc": args.kmax,
         "k_nyquist_h_Mpc": math.pi * args.grid / args.box_size,
     }
+    if has_binning_columns:
+        expected_floats["k_fundamental_h_Mpc"] = (
+            2.0 * math.pi / args.box_size
+        )
     expected_optional_floats = {
         "redshift": expected_redshift,
         "astra_r_lower": (
@@ -2370,9 +2705,12 @@ def validate_existing_spectrum_csv(
             None if astra_provenance is None else astra_provenance.box_max
         ),
     }
+    if has_binning_columns:
+        expected_optional_floats["k_bin_width_h_Mpc"] = expected_bin_width
     expected_shot_noise = args.box_size**3 / n_objects
 
     previous_k = -math.inf
+    previous_bin_index = -1
     for row_number, row in enumerate(rows, start=2):
         for column, expected in expected_strings.items():
             if row.get(column) != expected:
@@ -2455,6 +2793,57 @@ def validate_existing_spectrum_csv(
             raise PowerSpectrumError(
                 f"{path}:{row_number}: notebook sigma(P0) is inconsistent"
             )
+        if has_binning_columns:
+            bin_index_text = row.get("k_bin_index", "")
+            bin_min_text = row.get("k_bin_min_h_Mpc", "")
+            bin_max_text = row.get("k_bin_max_h_Mpc", "")
+            if expected_bin_width is None:
+                if any(
+                    text != ""
+                    for text in (bin_index_text, bin_min_text, bin_max_text)
+                ):
+                    raise PowerSpectrumError(
+                        f"{path}:{row_number}: native Pylians rows must have "
+                        "empty fixed-bin fields"
+                    )
+            else:
+                bin_index = _csv_int(row, "k_bin_index", path)
+                bin_min = _csv_float(row, "k_bin_min_h_Mpc", path)
+                bin_max = _csv_float(row, "k_bin_max_h_Mpc", path)
+                if (
+                    expected_edges is None
+                    or bin_index < 0
+                    or bin_index + 1 >= len(expected_edges)
+                ):
+                    raise PowerSpectrumError(
+                        f"{path}:{row_number}: k_bin_index is outside the "
+                        "requested fixed-bin grid"
+                    )
+                if bin_index <= previous_bin_index:
+                    raise PowerSpectrumError(
+                        f"{path}:{row_number}: k_bin_index is not increasing"
+                    )
+                if not math.isclose(
+                    bin_min,
+                    float(expected_edges[bin_index]),
+                    rel_tol=1.0e-10,
+                    abs_tol=1.0e-10,
+                ) or not math.isclose(
+                    bin_max,
+                    float(expected_edges[bin_index + 1]),
+                    rel_tol=1.0e-10,
+                    abs_tol=1.0e-10,
+                ):
+                    raise PowerSpectrumError(
+                        f"{path}:{row_number}: fixed-bin edges do not match "
+                        "the requested k grid"
+                    )
+                tolerance = max(1.0e-12, abs(bin_max) * 1.0e-12)
+                if k < bin_min - tolerance or k > bin_max + tolerance:
+                    raise PowerSpectrumError(
+                        f"{path}:{row_number}: effective k lies outside its bin"
+                    )
+                previous_bin_index = bin_index
         previous_k = k
 
 
@@ -2530,6 +2919,7 @@ def _compute_and_write(
         kmin=args.kmin,
         kmax=args.kmax,
         verbose=not args.quiet_pylians,
+        k_bin_width=getattr(args, "k_bin_width", None),
     )
     write_spectrum_csv(
         output_path,
@@ -2552,7 +2942,8 @@ def _compute_and_write(
     )
     elapsed = time.perf_counter() - start
     _log(
-        f"[write] {output_path} ({len(spectrum.k)} k shells, {elapsed:.1f} s)"
+        f"[write] {output_path} ({len(spectrum.k)} k rows, "
+        f"{spectrum.binning_mode}, {elapsed:.1f} s)"
     )
     counters.written += 1
     del spectrum
@@ -2648,6 +3039,17 @@ def process_simulation(
             f"[plan] {dataset} sim={simulation_id} snap={args.snapnum} "
             f"catalogue={catalogue}"
         )
+        resolved_bin_width = resolve_k_bin_width(
+            args.box_size,
+            args.k_bin_width,
+        )
+        if resolved_bin_width is None:
+            _log("       k binning: native Pylians shells")
+        else:
+            _log(
+                "       k binning: fixed Nmodes-weighted bins, "
+                f"Delta k={resolved_bin_width:.12g} h/Mpc"
+            )
         if do_matter:
             state = "overwrite" if matter_path.exists() else "write"
             if matter_path.exists() and not args.overwrite:
