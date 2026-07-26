@@ -192,14 +192,18 @@ def import_readfof(
 ) -> Any:
     """Import Pylians' standalone ``readfof.py`` module."""
 
-    library = _as_path(pylians_library)
-    module_path = library / "readfof.py"
-    if not module_path.is_file():
-        raise FileNotFoundError(f"Pylians readfof module not found: {module_path}")
-    library_text = str(library)
-    if library_text not in sys.path:
-        sys.path.insert(0, library_text)
-    return importlib.import_module("readfof")
+    try:
+        import readfof  # type: ignore[import]
+        return readfof
+    except ImportError:
+        library = _as_path(pylians_library)
+        module_path = library / "readfof.py"
+        if not module_path.is_file():
+            raise FileNotFoundError(f"Pylians readfof module not found: {module_path}")
+        library_text = str(library)
+        if library_text not in sys.path:
+            sys.path.insert(0, library_text)
+        return importlib.import_module("readfof")
 
 
 def _stage_part(source: Path, destination: Path) -> None:
