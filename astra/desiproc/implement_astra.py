@@ -1247,7 +1247,7 @@ def save_classification_fits(rows, output_path, meta=None):
                 if chunk.size == 0:
                     yield chunk
                     continue
-                rand_vals = np.asarray(chunk['RANDITER'], dtype=np.int32, copy=False)
+                rand_vals = np.asarray(chunk['RANDITER'], dtype=np.int32)
                 unique_vals = np.unique(rand_vals)
                 for val in unique_vals:
                     mask = (rand_vals == val)
