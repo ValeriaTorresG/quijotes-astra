@@ -339,8 +339,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=_path,
         default=None,
         help=(
-            "root containing ASTRA run directories; defaults to DATA_ROOT "
-            "(an optional DATA_ROOT/astra subdirectory is also searched)"
+            "root containing ASTRA runs as DATASET/SIMULATION or "
+            "DATASET_SIMULATION; defaults to DATA_ROOT (an optional "
+            "DATA_ROOT/astra subdirectory is also searched)"
         ),
     )
     parser.add_argument(
@@ -581,6 +582,8 @@ def _matching_run_directories(
     dataset: str,
     simulation_id: int,
 ) -> list[Path]:
+    """Find both ``dataset_sim`` and ``dataset/sim`` ASTRA run layouts."""
+
     matcher = re.compile(rf"^{re.escape(dataset)}_(\d+)$")
     candidates: list[Path] = []
     search_roots = [astra_root]
@@ -593,13 +596,62 @@ def _matching_run_directories(
         own_match = matcher.match(search_root.name)
         if own_match and int(own_match.group(1)) == simulation_id:
             candidates.append(search_root)
+        if (
+            search_root.name.isdigit()
+            and int(search_root.name) == simulation_id
+            and search_root.parent.name == dataset
+        ):
+            candidates.append(search_root)
         for child in search_root.iterdir():
             if not child.is_dir():
                 continue
             match = matcher.match(child.name)
             if match and int(match.group(1)) == simulation_id:
                 candidates.append(child)
-    return sorted(set(candidates))
+            if (
+                search_root.name == dataset
+                and child.name.isdigit()
+                and int(child.name) == simulation_id
+            ):
+                candidates.append(child)
+        dataset_root = search_root / dataset
+        if dataset_root.is_dir():
+            candidates.extend(
+                child
+                for child in dataset_root.iterdir()
+                if child.is_dir()
+                and child.name.isdigit()
+                and int(child.name) == simulation_id
+            )
+    return sorted(set(path.resolve() for path in candidates))
+
+
+def _expected_astra_run_message(
+    astra_root: Path,
+    dataset: str,
+    simulation_id: int,
+) -> str:
+    """Describe the two supported run-directory layouts in errors."""
+
+    if (
+        astra_root.name.isdigit()
+        and int(astra_root.name) == simulation_id
+        and astra_root.parent.name == dataset
+    ):
+        nested_example = astra_root
+    elif astra_root.name == dataset:
+        nested_example = astra_root / str(simulation_id)
+    else:
+        nested_example = astra_root / dataset / str(simulation_id)
+    legacy_match = re.match(
+        rf"^{re.escape(dataset)}_(\d+)$",
+        astra_root.name,
+    )
+    if legacy_match and int(legacy_match.group(1)) == simulation_id:
+        legacy_example = astra_root
+    else:
+        legacy_example = astra_root / f"{dataset}_{simulation_id}"
+    return f"{nested_example} or {legacy_example}"
 
 
 def resolve_probability_path(
@@ -620,10 +672,10 @@ def resolve_probability_path(
         astra_root, dataset, simulation_id
     )
     if not run_directories:
-        expected = astra_root / f"{dataset}_{simulation_id}"
         raise FileNotFoundError(
             f"ASTRA run directory not found for {dataset} simulation "
-            f"{simulation_id}; expected a directory such as {expected}"
+            f"{simulation_id}; expected a directory such as "
+            f"{_expected_astra_run_message(astra_root, dataset, simulation_id)}"
         )
 
     matches_by_run: dict[Path, list[Path]] = {}
@@ -677,10 +729,10 @@ def resolve_classification_paths(
         astra_root, dataset, simulation_id
     )
     if not run_directories:
-        expected = astra_root / f"{dataset}_{simulation_id}"
         raise FileNotFoundError(
             f"ASTRA run directory not found for {dataset} simulation "
-            f"{simulation_id}; expected a directory such as {expected}"
+            f"{simulation_id}; expected a directory such as "
+            f"{_expected_astra_run_message(astra_root, dataset, simulation_id)}"
         )
 
     matches_by_run: dict[Path, dict[int, Path]] = {}
@@ -744,10 +796,10 @@ def resolve_raw_path(
         astra_root, dataset, simulation_id
     )
     if not run_directories:
-        expected = astra_root / f"{dataset}_{simulation_id}"
         raise FileNotFoundError(
             f"ASTRA run directory not found for {dataset} simulation "
-            f"{simulation_id}; expected a directory such as {expected}"
+            f"{simulation_id}; expected a directory such as "
+            f"{_expected_astra_run_message(astra_root, dataset, simulation_id)}"
         )
     matches_by_run: dict[Path, list[Path]] = {}
     for run_directory in run_directories:

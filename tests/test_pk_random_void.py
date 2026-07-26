@@ -219,6 +219,60 @@ def test_missing_classification_iteration_is_rejected(astra_random_products):
         )
 
 
+@pytest.mark.parametrize("simulation_directory", ["0", "000"])
+def test_astra_resolvers_support_dataset_simulation_layout(
+    tmp_path,
+    simulation_directory,
+):
+    astra_root = tmp_path / "astra-prod"
+    dataset_root = astra_root / "Om_m"
+    run = dataset_root / simulation_directory
+    probability = (
+        run
+        / "astra"
+        / "probabilities"
+        / "sim000"
+        / "00"
+        / "zone_00_sim000_snap003_probability_iterdata.fits.gz"
+    )
+    probability.parent.mkdir(parents=True)
+    probability.touch()
+    classification_dir = (
+        run / "astra" / "classification" / "sim000" / "00"
+    )
+    classification_dir.mkdir(parents=True)
+    classifications = []
+    for iteration in range(2):
+        path = classification_dir / (
+            f"zone_00_sim000_snap003_iter{iteration:03d}.fits.gz"
+        )
+        path.touch()
+        classifications.append(path.resolve())
+    raw = run / "raw" / "zone_00_sim000_snap003.fits.gz"
+    raw.parent.mkdir()
+    raw.touch()
+
+    for supplied_root in (astra_root, dataset_root, run):
+        assert cps.resolve_probability_path(
+            supplied_root,
+            "Om_m",
+            0,
+            SNAPSHOT,
+        ) == probability.resolve()
+        assert cps.resolve_classification_paths(
+            supplied_root,
+            "Om_m",
+            0,
+            SNAPSHOT,
+        ) == tuple(classifications)
+        assert cps.resolve_raw_path(
+            supplied_root,
+            "Om_m",
+            0,
+            SNAPSHOT,
+        ) == raw.resolve()
+
+
 def test_random_void_csv_records_and_validates_source_provenance(
     astra_random_products,
     tmp_path,
