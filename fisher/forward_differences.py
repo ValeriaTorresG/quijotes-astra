@@ -14,12 +14,16 @@ if __package__:
     from .derivative_utils import (
         DerivativeError,
         DerivativeProduct,
+        COMBINED_CATEGORY,
+        COMBINED_ENVIRONMENT_SAMPLES,
         ProductKey,
         SpectrumCSV,
         add_common_cli_arguments,
         atomic_write_csv,
         build_summary_rows,
         check_output_collisions,
+        combine_environment_derivatives,
+        combined_observable,
         derivative_output_path,
         discover_matched_products,
         finish_common_args,
@@ -34,12 +38,16 @@ else:
     from derivative_utils import (  # type: ignore[no-redef]
         DerivativeError,
         DerivativeProduct,
+        COMBINED_CATEGORY,
+        COMBINED_ENVIRONMENT_SAMPLES,
         ProductKey,
         SpectrumCSV,
         add_common_cli_arguments,
         atomic_write_csv,
         build_summary_rows,
         check_output_collisions,
+        combine_environment_derivatives,
+        combined_observable,
         derivative_output_path,
         discover_matched_products,
         finish_common_args,
@@ -92,6 +100,36 @@ def derivative_columns(observables: Sequence[str]) -> list[str]:
     ]
 
 
+def combined_derivative_columns(
+    observables: Sequence[str],
+) -> list[str]:
+    return derivative_columns(
+        [
+            combined_observable(sample, observable)
+            for sample in COMBINED_ENVIRONMENT_SAMPLES
+            for observable in observables
+        ]
+    )
+
+
+def combined_column_pairs(
+    observables: Sequence[str],
+) -> list[tuple[str, str, str]]:
+    return [
+        (
+            sample,
+            derivative_column(order, observable),
+            derivative_column(
+                order,
+                combined_observable(sample, observable),
+            ),
+        )
+        for sample in COMBINED_ENVIRONMENT_SAMPLES
+        for order in (1, 2, 3)
+        for observable in observables
+    ]
+
+
 def scheme_metadata() -> dict[str, object]:
     metadata: dict[str, object] = {
         "finite_difference_scheme": "paired_forward_first_derivative",
@@ -133,6 +171,8 @@ def compute_products(
     maps: dict[str, dict[ProductKey, Path]],
     keys: Sequence[ProductKey],
     observables: Sequence[str],
+    *,
+    max_bins: int | None = None,
 ) -> list[DerivativeProduct]:
     """Form all three Mnu stencils separately for every realization."""
 
@@ -144,6 +184,7 @@ def compute_products(
                 expected_dataset=dataset,
                 expected_key=key,
                 columns=observables,
+                max_bins=max_bins,
             )
             for dataset in _datasets()
         }
@@ -210,12 +251,26 @@ def run(args: argparse.Namespace) -> tuple[int, int]:
     for warning in warnings:
         print(f"[warning] {warning}", file=sys.stderr)
 
+    products = compute_products(
+        maps,
+        keys,
+        args.columns,
+        max_bins=args.max_bins,
+    )
+    if args.combine_environments:
+        products.extend(
+            combine_environment_derivatives(
+                products,
+                combined_column_pairs(args.columns),
+            )
+        )
     output_paths = [
-        derivative_output_path(args.output_root, SCHEME_NAME, key)
-        for key in keys
+        derivative_output_path(args.output_root, SCHEME_NAME, product.key)
+        for product in products
     ]
     group_keys: dict[tuple[str, str, int], ProductKey] = {}
-    for key in keys:
+    for product in products:
+        key = product.key
         group_keys.setdefault(
             (key.category, key.sample, key.snapshot),
             key,
@@ -229,14 +284,19 @@ def run(args: argparse.Namespace) -> tuple[int, int]:
         args.overwrite,
     )
 
-    products = compute_products(maps, keys, args.columns)
     result_columns = derivative_columns(args.columns)
+    combined_columns = combined_derivative_columns(args.columns)
     metadata = scheme_metadata()
     prepared_summaries = []
     for group in group_products_for_summary(products):
+        columns = (
+            combined_columns
+            if group[0].key.category == COMBINED_CATEGORY
+            else result_columns
+        )
         fields, rows = build_summary_rows(
             group,
-            derivative_columns=result_columns,
+            derivative_columns=columns,
             ddof=args.ddof,
             common_metadata=metadata,
         )
@@ -248,10 +308,15 @@ def run(args: argparse.Namespace) -> tuple[int, int]:
         prepared_summaries.append((path, fields, rows))
 
     for product in products:
+        columns = (
+            combined_columns
+            if product.key.category == COMBINED_CATEGORY
+            else result_columns
+        )
         path = write_product(
             product,
             args.output_root,
-            columns=result_columns,
+            columns=columns,
             metadata=metadata,
             overwrite=args.overwrite,
         )

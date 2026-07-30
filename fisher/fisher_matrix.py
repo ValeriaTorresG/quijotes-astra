@@ -17,6 +17,8 @@ import numpy as np
 if __package__:
     from .derivative_utils import (
         DEFAULT_PK_ROOT,
+        COMBINED_CATEGORY,
+        COMBINED_SAMPLE,
         DerivativeError,
         KNOWN_SAMPLES,
         atomic_write_csv,
@@ -27,6 +29,8 @@ if __package__:
 else:
     from derivative_utils import (  # type: ignore[no-redef]
         DEFAULT_PK_ROOT,
+        COMBINED_CATEGORY,
+        COMBINED_SAMPLE,
         DerivativeError,
         KNOWN_SAMPLES,
         atomic_write_csv,
@@ -40,6 +44,7 @@ DEFAULT_FISHER_ROOT = DEFAULT_PK_ROOT / "fisher"
 DEFAULT_PARAMETERS = ("Om", "h", "ns", "s8", "Mnu")
 CENTRAL_PARAMETERS = frozenset(("Om", "h", "ns", "s8"))
 DATASET = "fiducial"
+FISHER_SAMPLES = (*KNOWN_SAMPLES, COMBINED_SAMPLE)
 
 
 @dataclass(frozen=True, order=True)
@@ -157,7 +162,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--samples",
         nargs="+",
-        choices=KNOWN_SAMPLES,
+        choices=FISHER_SAMPLES,
         default=None,
         metavar="SAMPLE",
         help=(
@@ -336,6 +341,21 @@ def discover_covariance_keys(
             sample = match.group("sample")
             if samples is None or sample in samples:
                 keys.append(FisherKey("env", sample, snapshot))
+    combined_name = (
+        f"{DATASET}_snap{snapshot:03d}_{COMBINED_SAMPLE}_data_vector.csv"
+    )
+    combined_path = (
+        fisher_root
+        / "covariance"
+        / COMBINED_CATEGORY
+        / combined_name
+    )
+    if combined_path.is_file() and (
+        samples is None or COMBINED_SAMPLE in samples
+    ):
+        keys.append(
+            FisherKey(COMBINED_CATEGORY, COMBINED_SAMPLE, snapshot)
+        )
     if samples is not None:
         seen = {key.sample for key in keys}
         missing = samples - seen

@@ -14,16 +14,22 @@ import numpy as np
 if __package__:
     from .derivative_utils import (
         DEFAULT_PK_ROOT,
+        COMBINED_CATEGORY,
+        COMBINED_ENVIRONMENT_SAMPLES,
+        COMBINED_SAMPLE,
         DerivativeError,
         KNOWN_SAMPLES,
         ProductKey,
         SpectrumCSV,
         atomic_write_csv,
         check_output_collisions,
+        combine_environment_spectra,
+        combined_observable,
         discover_dataset_products,
         nonnegative_int,
         parse_simulation_ids,
         path_arg,
+        positive_int,
         read_spectrum_csv,
         validate_compatible_spectra,
         validate_observable_names,
@@ -31,16 +37,22 @@ if __package__:
 else:
     from derivative_utils import (  # type: ignore[no-redef]
         DEFAULT_PK_ROOT,
+        COMBINED_CATEGORY,
+        COMBINED_ENVIRONMENT_SAMPLES,
+        COMBINED_SAMPLE,
         DerivativeError,
         KNOWN_SAMPLES,
         ProductKey,
         SpectrumCSV,
         atomic_write_csv,
         check_output_collisions,
+        combine_environment_spectra,
+        combined_observable,
         discover_dataset_products,
         nonnegative_int,
         parse_simulation_ids,
         path_arg,
+        positive_int,
         read_spectrum_csv,
         validate_compatible_spectra,
         validate_observable_names,
@@ -129,6 +141,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--max-bins",
+        type=positive_int,
+        default=None,
+        metavar="N",
+        help=(
+            "keep only the first N increasing-k bins per observable in the "
+            "data vector"
+        ),
+    )
+    parser.add_argument(
         "--ddof",
         type=int,
         choices=(0, 1),
@@ -141,6 +163,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "when explicit IDs are requested, let each sample use its available "
             "subset; by default every requested ID must exist for every sample"
+        ),
+    )
+    parser.add_argument(
+        "--combine-environments",
+        action="store_true",
+        help=(
+            "also estimate the joint void+sheet+filament+knot covariance, "
+            "including every cross-environment block"
         ),
     )
     parser.add_argument(
@@ -163,6 +193,14 @@ def finish_args(
     args.simulation_ids = parse_simulation_ids(args.simulation_ids, parser)
     args.samples = None if args.samples is None else set(args.samples)
     args.columns = validate_observable_names(args.columns, parser)
+    if args.combine_environments and args.samples is not None:
+        missing = set(COMBINED_ENVIRONMENT_SAMPLES) - args.samples
+        if missing:
+            parser.error(
+                "--combine-environments requires selecting void, sheet, "
+                "filament, and knot; missing: "
+                + ", ".join(sorted(missing))
+            )
 
 
 def _group_selected_paths(
@@ -482,27 +520,61 @@ def run(args: argparse.Namespace) -> tuple[int, int]:
         covariance_paths(args.output_root, products[0][0])
         for _, products in groups
     ]
+    if args.combine_environments:
+        combined_key = ProductKey(
+            COMBINED_CATEGORY,
+            COMBINED_SAMPLE,
+            args.snapnum,
+            0,
+        )
+        output_pairs.append(covariance_paths(args.output_root, combined_key))
     check_output_collisions(
         [path for pair in output_pairs for path in pair],
         args.overwrite,
     )
 
-    prepared = []
-    for _, products in groups:
-        spectra = [
+    spectra_by_group: dict[tuple[str, str, int], list[SpectrumCSV]] = {}
+    for group, products in groups:
+        spectra_by_group[group] = [
             read_spectrum_csv(
                 path,
                 expected_dataset=DATASET,
                 expected_key=key,
                 columns=args.columns,
+                max_bins=args.max_bins,
             )
             for key, path in products
         ]
-        result = estimate_covariance(
+    results = [
+        estimate_covariance(
             spectra,
             args.columns,
             ddof=args.ddof,
         )
+        for spectra in spectra_by_group.values()
+    ]
+    if args.combine_environments:
+        combined_spectra = combine_environment_spectra(
+            {
+                sample: spectra_by_group[("env", sample, args.snapnum)]
+                for sample in COMBINED_ENVIRONMENT_SAMPLES
+            }
+        )
+        combined_observables = [
+            combined_observable(sample, observable)
+            for sample in COMBINED_ENVIRONMENT_SAMPLES
+            for observable in args.columns
+        ]
+        results.append(
+            estimate_covariance(
+                combined_spectra,
+                combined_observables,
+                ddof=args.ddof,
+            )
+        )
+
+    prepared = []
+    for result in results:
         vector_fields, vector_rows = data_vector_rows(
             result,
             ddof=args.ddof,

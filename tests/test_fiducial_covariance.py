@@ -272,6 +272,105 @@ def test_covariance_rejects_misaligned_k_grids(tmp_path, capsys):
     assert "k grid mismatch" in capsys.readouterr().err
 
 
+def test_max_bins_reduces_each_covariance_observable_block(tmp_path):
+    pk_root = tmp_path / "pk"
+    output_root = tmp_path / "results"
+    k = np.array([0.01, 0.02, 0.03])
+    for simulation_id in range(4):
+        vector = np.array(
+            [simulation_id + 1.0, 2.0 * simulation_id + 1.0, 7.0]
+        )
+        _write_spectrum(
+            pk_root,
+            "fiducial",
+            simulation_id,
+            _values(vector),
+            k=k,
+        )
+
+    status = covariance.main(
+        [
+            "--pk-root",
+            str(pk_root),
+            "--output-root",
+            str(output_root),
+            "--max-bins",
+            "2",
+        ]
+    )
+    assert status == 0
+    mapping = _read_rows(
+        output_root
+        / "covariance"
+        / "matter"
+        / "fiducial_snap003_data_vector.csv"
+    )
+    assert len(mapping) == 2
+    assert [float(row["k_h_Mpc"]) for row in mapping] == [0.01, 0.02]
+    assert {row["data_vector_size"] for row in mapping} == {"2"}
+
+
+def test_combined_environment_covariance_keeps_cross_blocks(tmp_path):
+    pk_root = tmp_path / "pk"
+    output_root = tmp_path / "results"
+    samples = ("void", "sheet", "filament", "knot")
+    vectors = np.asarray(
+        [
+            [1.0, 2.0, 4.0, 8.0],
+            [2.0, 1.0, 5.0, 7.0],
+            [4.0, 3.0, 1.0, 6.0],
+            [7.0, 5.0, 2.0, 1.0],
+            [9.0, 8.0, 7.0, 3.0],
+        ]
+    )
+    k = np.array([0.01])
+    for simulation_id, vector in enumerate(vectors):
+        for sample, value in zip(samples, vector):
+            _write_spectrum(
+                pk_root,
+                "fiducial",
+                simulation_id,
+                _values([value]),
+                sample=sample,
+                k=k,
+            )
+
+    status = covariance.main(
+        [
+            "--pk-root",
+            str(pk_root),
+            "--output-root",
+            str(output_root),
+            "--samples",
+            *samples,
+            "--combine-environments",
+        ]
+    )
+    assert status == 0
+    mapping = _read_rows(
+        output_root
+        / "covariance"
+        / "combined"
+        / "fiducial_snap003_combined_data_vector.csv"
+    )
+    assert [row["observable"] for row in mapping] == [
+        f"{sample}__Pk0_shot_subtracted_Mpc3_h3"
+        for sample in samples
+    ]
+    matrix_rows = _read_rows(
+        output_root
+        / "covariance"
+        / "combined"
+        / "fiducial_snap003_combined_covariance.csv"
+    )
+    labels = [f"v{index:06d}" for index in range(4)]
+    actual = np.asarray(
+        [[float(row[label]) for label in labels] for row in matrix_rows]
+    )
+    np.testing.assert_allclose(actual, np.cov(vectors, rowvar=False, ddof=1))
+    assert actual[0, 1] != 0.0
+
+
 def test_explicit_ids_must_exist_for_every_selected_sample(tmp_path, capsys):
     pk_root = tmp_path / "pk"
     for simulation_id in (0, 1):

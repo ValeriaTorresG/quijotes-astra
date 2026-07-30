@@ -23,6 +23,9 @@ DEFAULT_OBSERVABLE_COLUMNS = (
     "Pk4_Mpc3_h3",
 )
 KNOWN_SAMPLES = ("all", "void", "sheet", "filament", "knot", "random_void")
+COMBINED_ENVIRONMENT_SAMPLES = ("void", "sheet", "filament", "knot")
+COMBINED_SAMPLE = "combined"
+COMBINED_CATEGORY = "combined"
 
 TEXT_COMPATIBILITY_COLUMNS = (
     "mass_assignment",
@@ -110,6 +113,13 @@ def nonnegative_int(value: str) -> int:
     parsed = int(value)
     if parsed < 0:
         raise argparse.ArgumentTypeError("value must be a non-negative integer")
+    return parsed
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be a positive integer")
     return parsed
 
 
@@ -212,6 +222,13 @@ def add_common_cli_arguments(parser: argparse.ArgumentParser) -> None:
         help="numeric data-vector columns to differentiate",
     )
     parser.add_argument(
+        "--max-bins",
+        type=positive_int,
+        default=None,
+        metavar="N",
+        help="keep only the first N increasing-k bins of every spectrum",
+    )
+    parser.add_argument(
         "--ddof",
         type=int,
         choices=(0, 1),
@@ -224,6 +241,14 @@ def add_common_cli_arguments(parser: argparse.ArgumentParser) -> None:
         help=(
             "process only the exact product intersection when some datasets "
             "lack counterparts; by default any missing counterpart is an error"
+        ),
+    )
+    parser.add_argument(
+        "--combine-environments",
+        action="store_true",
+        help=(
+            "also concatenate void, sheet, filament, and knot into one "
+            "realization-matched combined data vector"
         ),
     )
     parser.add_argument(
@@ -247,6 +272,14 @@ def finish_common_args(
     args.simulation_ids = parse_simulation_ids(args.simulation_ids, parser)
     args.samples = None if args.samples is None else set(args.samples)
     args.columns = validate_observable_names(args.columns, parser)
+    if args.combine_environments and args.samples is not None:
+        missing = set(COMBINED_ENVIRONMENT_SAMPLES) - args.samples
+        if missing:
+            parser.error(
+                "--combine-environments requires selecting void, sheet, "
+                "filament, and knot; missing: "
+                + ", ".join(sorted(missing))
+            )
 
 
 def _dataset_patterns(dataset: str) -> tuple[re.Pattern[str], re.Pattern[str]]:
@@ -495,6 +528,7 @@ def read_spectrum_csv(
     expected_dataset: str,
     expected_key: ProductKey,
     columns: Sequence[str],
+    max_bins: int | None = None,
 ) -> SpectrumCSV:
     """Read one spectrum and verify filename identity against CSV metadata."""
 
@@ -526,6 +560,11 @@ def read_spectrum_csv(
         raise DerivativeError(f"cannot read {path}: {exc}") from exc
     if not rows:
         raise DerivativeError(f"{path}: spectrum CSV has no k rows")
+    if max_bins is not None and max_bins > len(rows):
+        raise DerivativeError(
+            f"{path}: --max-bins={max_bins}, but the spectrum has only "
+            f"{len(rows)} bins"
+        )
 
     constant_columns = {
         "dataset",
@@ -625,18 +664,31 @@ def read_spectrum_csv(
         )
         for column in columns
     }
+    selected = slice(None, max_bins)
+    k_bin_index = _optional_int_array(rows, "k_bin_index", path)
+    k_bin_min = _optional_float_array(rows, "k_bin_min_h_Mpc", path)
+    k_bin_max = _optional_float_array(rows, "k_bin_max_h_Mpc", path)
     return SpectrumCSV(
         path=path,
         dataset=dataset,
         key=expected_key,
         tracer=metadata["tracer"],
         metadata=metadata,
-        k=k,
-        nmodes=nmodes,
-        k_bin_index=_optional_int_array(rows, "k_bin_index", path),
-        k_bin_min=_optional_float_array(rows, "k_bin_min_h_Mpc", path),
-        k_bin_max=_optional_float_array(rows, "k_bin_max_h_Mpc", path),
-        values=values,
+        k=k[selected],
+        nmodes=nmodes[selected],
+        k_bin_index=(
+            None if k_bin_index is None else k_bin_index[selected]
+        ),
+        k_bin_min=(
+            None if k_bin_min is None else k_bin_min[selected]
+        ),
+        k_bin_max=(
+            None if k_bin_max is None else k_bin_max[selected]
+        ),
+        values={
+            column: column_values[selected]
+            for column, column_values in values.items()
+        },
     )
 
 
@@ -740,6 +792,163 @@ def validate_compatible_spectra(
                 f"{column} mismatch between {reference.path} and "
                 f"{candidate.path}"
             )
+
+
+def combined_observable(sample: str, observable: str) -> str:
+    """Name one observable block inside the joint environment vector."""
+
+    if sample not in COMBINED_ENVIRONMENT_SAMPLES:
+        raise DerivativeError(
+            f"{sample!r} is not part of the combined environment vector"
+        )
+    return f"{sample}__{observable}"
+
+
+def _combined_key(snapshot: int, simulation_id: int) -> ProductKey:
+    return ProductKey(
+        COMBINED_CATEGORY,
+        COMBINED_SAMPLE,
+        snapshot,
+        simulation_id,
+    )
+
+
+def combine_environment_spectra(
+    spectra_by_sample: Mapping[str, Sequence[SpectrumCSV]],
+) -> list[SpectrumCSV]:
+    """Concatenate four environment spectra after exact realization matching."""
+
+    missing = [
+        sample
+        for sample in COMBINED_ENVIRONMENT_SAMPLES
+        if sample not in spectra_by_sample
+    ]
+    if missing:
+        raise DerivativeError(
+            "cannot build combined environment vector; missing samples: "
+            + ", ".join(missing)
+        )
+    maps = {
+        sample: {
+            spectrum.key.simulation_id: spectrum
+            for spectrum in spectra_by_sample[sample]
+        }
+        for sample in COMBINED_ENVIRONMENT_SAMPLES
+    }
+    common_ids = set.intersection(
+        *(set(spectra) for spectra in maps.values())
+    )
+    if not common_ids:
+        raise DerivativeError(
+            "void, sheet, filament, and knot have no common realization IDs"
+        )
+    combined: list[SpectrumCSV] = []
+    for simulation_id in sorted(common_ids):
+        key = _combined_key(
+            maps[COMBINED_ENVIRONMENT_SAMPLES[0]][simulation_id].key.snapshot,
+            simulation_id,
+        )
+        components = {
+            sample: maps[sample][simulation_id]
+            for sample in COMBINED_ENVIRONMENT_SAMPLES
+        }
+        reference = components[COMBINED_ENVIRONMENT_SAMPLES[0]]
+        synthetic_reference = SpectrumCSV(
+            path=reference.path,
+            dataset=reference.dataset,
+            key=key,
+            tracer=reference.tracer,
+            metadata=reference.metadata,
+            k=reference.k,
+            nmodes=reference.nmodes,
+            k_bin_index=reference.k_bin_index,
+            k_bin_min=reference.k_bin_min,
+            k_bin_max=reference.k_bin_max,
+            values={},
+        )
+        values: dict[str, np.ndarray] = {}
+        for sample, spectrum in components.items():
+            synthetic_candidate = SpectrumCSV(
+                path=spectrum.path,
+                dataset=spectrum.dataset,
+                key=key,
+                tracer=spectrum.tracer,
+                metadata=spectrum.metadata,
+                k=spectrum.k,
+                nmodes=spectrum.nmodes,
+                k_bin_index=spectrum.k_bin_index,
+                k_bin_min=spectrum.k_bin_min,
+                k_bin_max=spectrum.k_bin_max,
+                values={},
+            )
+            validate_compatible_spectra(
+                synthetic_reference,
+                synthetic_candidate,
+                same_realization=True,
+            )
+            for observable, observable_values in spectrum.values.items():
+                values[combined_observable(sample, observable)] = (
+                    observable_values
+                )
+        synthetic_reference.values = values
+        combined.append(synthetic_reference)
+    return combined
+
+
+def combine_environment_derivatives(
+    products: Sequence[DerivativeProduct],
+    column_pairs: Sequence[tuple[str, str, str]],
+) -> list[DerivativeProduct]:
+    """Combine per-sample derivatives.
+
+    ``column_pairs`` contains ``(sample, source_column, combined_column)``.
+    """
+
+    maps: dict[str, dict[int, DerivativeProduct]] = {
+        sample: {} for sample in COMBINED_ENVIRONMENT_SAMPLES
+    }
+    for product in products:
+        if product.key.sample in maps:
+            maps[product.key.sample][product.key.simulation_id] = product
+    missing = [sample for sample, sample_map in maps.items() if not sample_map]
+    if missing:
+        raise DerivativeError(
+            "cannot build combined environment derivatives; missing samples: "
+            + ", ".join(missing)
+        )
+    common_ids = set.intersection(*(set(products) for products in maps.values()))
+    if not common_ids:
+        raise DerivativeError(
+            "environment derivatives have no common realization IDs"
+        )
+    combined: list[DerivativeProduct] = []
+    for simulation_id in sorted(common_ids):
+        components = {
+            sample: maps[sample][simulation_id]
+            for sample in COMBINED_ENVIRONMENT_SAMPLES
+        }
+        reference = components[COMBINED_ENVIRONMENT_SAMPLES[0]].grid
+        spectra = combine_environment_spectra(
+            {
+                sample: [product.grid]
+                for sample, product in components.items()
+            }
+        )
+        grid = spectra[0]
+        derivatives = {
+            combined_column: components[sample].derivatives[source_column]
+            for sample, source_column, combined_column in column_pairs
+        }
+        if grid.key.snapshot != reference.key.snapshot:
+            raise DerivativeError("combined derivative snapshot mismatch")
+        combined.append(
+            DerivativeProduct(
+                key=grid.key,
+                grid=grid,
+                derivatives=derivatives,
+            )
+        )
+    return combined
     for column in INTEGER_COMPATIBILITY_COLUMNS:
         if not _optional_metadata_equal(
             reference, candidate, column, numeric="int"

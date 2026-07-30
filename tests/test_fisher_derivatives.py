@@ -259,6 +259,84 @@ def test_forward_stencils_use_0_h_2h_4h_and_positive_last_weight(tmp_path):
         np.testing.assert_array_equal(estimate, 0.0)
 
 
+def test_max_bins_keeps_only_the_lowest_k_rows(tmp_path):
+    pk_root = tmp_path / "pk"
+    output_root = tmp_path / "results"
+    k = np.array([0.01, 0.02, 0.03])
+    for dataset, mass in forward.MNU_DATASETS:
+        _write_spectrum(
+            pk_root,
+            dataset,
+            0,
+            np.array([1.0, 2.0, 3.0]) + mass,
+            k=k,
+        )
+
+    status = forward.main(
+        [
+            "--pk-root",
+            str(pk_root),
+            "--output-root",
+            str(output_root),
+            "--max-bins",
+            "2",
+        ]
+    )
+    assert status == 0
+    rows = _read_rows(
+        output_root
+        / "forward"
+        / "matter"
+        / "sim000_snap003_derivatives.csv"
+    )
+    assert [float(row["k_h_Mpc"]) for row in rows] == [0.01, 0.02]
+
+
+def test_central_writes_realization_matched_combined_environment_vector(
+    tmp_path,
+):
+    pk_root = tmp_path / "pk"
+    output_root = tmp_path / "results"
+    for dataset, parameter_value in _central_dataset_values().items():
+        for sample_index, sample in enumerate(
+            ("void", "sheet", "filament", "knot"),
+            start=1,
+        ):
+            _write_spectrum(
+                pk_root,
+                dataset,
+                0,
+                sample_index * np.array([10.0, 20.0]) + parameter_value,
+                sample=sample,
+            )
+
+    status = central.main(
+        [
+            "--pk-root",
+            str(pk_root),
+            "--output-root",
+            str(output_root),
+            "--samples",
+            "void",
+            "sheet",
+            "filament",
+            "knot",
+            "--combine-environments",
+        ]
+    )
+    assert status == 0
+    rows = _read_rows(
+        output_root
+        / "central"
+        / "combined"
+        / "snap003_combined_derivatives_mean_std.csv"
+    )
+    assert len(rows) == 2
+    assert {row["sample"] for row in rows} == {"combined"}
+    for sample in ("void", "sheet", "filament", "knot"):
+        assert f"mean_d_{sample}__Pk0_raw_Mpc3_h3_dOm" in rows[0]
+
+
 def test_missing_realization_counterpart_fails_in_strict_mode(
     tmp_path,
     capsys,
